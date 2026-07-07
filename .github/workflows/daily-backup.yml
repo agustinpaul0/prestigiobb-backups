@@ -1,0 +1,69 @@
+name: Daily Supabase Backup
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 3am UTC = 12am Argentina
+  workflow_dispatch:       # Para ejecutar manualmente
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y postgresql-client
+          pip install boto3 --quiet
+
+      - name: Export tables as CSV
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          mkdir -p backups
+          TABLES=$(psql "$DATABASE_URL" -t -c \
+            "SELECT tablename FROM pg_tables WHERE schemaname='public';")
+          for TABLE in $TABLES; do
+            TABLE=$(echo $TABLE | xargs)
+            echo "Exportando $TABLE..."
+            psql "$DATABASE_URL" -c "\COPY $TABLE TO 'backups/$TABLE.csv' WITH CSV HEADER"
+          done
+
+      - name: Upload to Backblaze B2
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+        run: |
+          python3 << 'EOF'
+          import os, boto3
+          from datetime import datetime, timezone
+
+          s3 = boto3.client(
+              's3',
+              endpoint_url=f"https://{os.environ['B2_ENDPOINT']}",
+              aws_access_key_id=os.environ['B2_KEY_ID'],
+              aws_secret_access_key=os.environ['B2_APP_KEY'],
+              region_name='us-east-1'  # B2 ignora esto pero boto3 lo requiere
+          )
+
+          bucket = os.environ['B2_BUCKET_NAME']
+          date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+          for filename in os.listdir('backups'):
+              if not filename.endswith('.csv'): continue
+              s3.upload_file(
+                  f'backups/{filename}',
+                  bucket,
+                  f'{date_str}/{filename}'
+              )
+              print(f'Subido: {date_str}/{filename}')
+
+          print('Backup completado!')
+          EOF
+
+      - name: Keep Supabase alive
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          psql "$DATABASE_URL" -c "SELECT 1"
